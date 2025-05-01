@@ -11,8 +11,14 @@ const Utils = require(`${__dirname}/utils`);
 const defaultModules = require(`${__dirname}/../modules/default/defaultmodules`);
 const { getEnvVarsAsObj } = require(`${__dirname}/server_functions`);
 
+// used to control fetch timeout for node_helpers
+const { setGlobalDispatcher, Agent } = require("undici");
+// common timeout value, provide environment override in case
+const fetch_timeout = process.env.mmFetchTimeout !== undefined ? process.env.mmFetchTimeout : 30000;
+
 // Get version number.
 global.version = require(`${__dirname}/../package.json`).version;
+global.mmTestMode = process.env.mmTestMode === "true";
 Log.log(`Starting MagicMirror: v${global.version}`);
 
 // Log system information.
@@ -147,11 +153,23 @@ function App () {
 	 */
 	function checkDeprecatedOptions (userConfig) {
 		const deprecated = require(`${global.root_path}/js/deprecated`);
-		const deprecatedOptions = deprecated.configs;
 
+		// check for deprecated core options
+		const deprecatedOptions = deprecated.configs;
 		const usedDeprecated = deprecatedOptions.filter((option) => userConfig.hasOwnProperty(option));
 		if (usedDeprecated.length > 0) {
-			Log.warn(`WARNING! Your config is using deprecated options: ${usedDeprecated.join(", ")}. Check README and CHANGELOG for more up-to-date ways of getting the same functionality.`);
+			Log.warn(`WARNING! Your config is using deprecated option(s): ${usedDeprecated.join(", ")}. Check README and CHANGELOG for more up-to-date ways of getting the same functionality.`);
+		}
+
+		// check for deprecated module options
+		for (const element of userConfig.modules) {
+			if (deprecated[element.module] !== undefined && element.config !== undefined) {
+				const deprecatedModuleOptions = deprecated[element.module];
+				const usedDeprecatedModuleOptions = deprecatedModuleOptions.filter((option) => element.config.hasOwnProperty(option));
+				if (usedDeprecatedModuleOptions.length > 0) {
+					Log.warn(`WARNING! Your config for module ${element.module} is using deprecated option(s): ${usedDeprecatedModuleOptions.join(", ")}. Check README and CHANGELOG for more up-to-date ways of getting the same functionality.`);
+				}
+			}
 		}
 	}
 
@@ -163,21 +181,21 @@ function App () {
 		const elements = module.split("/");
 		const moduleName = elements[elements.length - 1];
 		const env = getEnvVarsAsObj();
-		let moduleFolder = `${__dirname}/../${env.modulesDir}/${module}`;
+		let moduleFolder = path.resolve(`${__dirname}/../${env.modulesDir}`, module);
 
 		if (defaultModules.includes(moduleName)) {
-			const defaultModuleFolder = `${__dirname}/../modules/default/${module}`;
+			const defaultModuleFolder = path.resolve(`${__dirname}/../modules/default/`, module);
 			if (process.env.JEST_WORKER_ID === undefined) {
 				moduleFolder = defaultModuleFolder;
 			} else {
 				// running in Jest, allow defaultModules placed under moduleDir for testing
-				if (env.modulesDir === "modules") {
+				if (env.modulesDir === "modules" || env.modulesDir === "tests/mocks") {
 					moduleFolder = defaultModuleFolder;
 				}
 			}
 		}
 
-		const moduleFile = `${moduleFolder}/${module}.js`;
+		const moduleFile = `${moduleFolder}/${moduleName}.js`;
 
 		try {
 			fs.accessSync(moduleFile, fs.R_OK);
@@ -197,7 +215,13 @@ function App () {
 
 		// if the helper was found
 		if (loadHelper) {
-			const Module = require(helperPath);
+			let Module;
+			try {
+				Module = require(helperPath);
+			} catch (e) {
+				Log.error(`Error when loading ${moduleName}:`, e.message);
+				return;
+			}
 			let m = new Module();
 
 			if (m.requiresVersion) {
@@ -287,6 +311,8 @@ function App () {
 				Log.warn("No module name found for this configuration:" + `\n${JSON.stringify(module, null, 2)}`);
 			}
 		}
+
+		setGlobalDispatcher(new Agent({ connect: { timeout: fetch_timeout } }));
 
 		await loadModules(modules);
 
